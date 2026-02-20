@@ -1,0 +1,80 @@
+# ─── Training Configuration ───────────────────────────────────────────────
+
+# Experiment settings
+experiment:
+  name: "sentiment-classification-v1"
+  mlflow_uri: "http://localhost:5000"
+  description: "Multi-model sentiment analysis with BERT, CNN, LSTM"
+
+# Data settings
+data:
+  data_path: "data/raw/reviews.csv"
+  text_column: "text"
+  label_column: "sentiment"
+  max_length: 256
+  test_size: 0.2
+  val_size: 0.1
+  batch_size: 32
+  augment_data: true
+  random_seed: 42
+
+# CNN Model
+cnn:
+  vocab_size: 30000
+  embed_dim: 128
+  num_filters: 100
+  filter_sizes: [2, 3, 4, 5]
+  dropout_rate: 0.5
+  learning_rate: 0.001
+  epochs: 10
+  patience: 3
+
+# BiLSTM Model
+lstm:
+  vocab_size: 30000
+  embed_dim: 256
+  hidden_dim: 256
+  num_layers: 2
+  num_heads: 8
+  dropout_rate: 0.3
+  learning_rate: 0.0005
+  epochs: 10
+  patience: 3
+
+# BERT Model (DistilBERT fine-tuning)
+bert:
+  model_name: "distilbert-base-uncased"
+  pooling_strategy: "mean"   # cls, mean, max, weighted
+  dropout_rate: 0.3
+  freeze_layers: 0
+  learning_rate: 0.00002
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  scheduler: "cosine"
+  epochs: 10
+  patience: 3
+  batch_size: 16              # Smaller for BERT
+  label_smoothing: 0.1
+  use_mixed_precision: true
+
+# Ensemble
+ensemble:
+  strategy: "weighted"       # average, weighted, stacking
+  models: ["cnn", "lstm", "bert"]
+
+# Deployment thresholds
+deployment:
+  min_f1_for_promotion: 0.70
+  min_accuracy_for_promotion: 0.75
+  performance_degradation_threshold: 0.05
+  drift_psi_threshold: 0.2
+
+# HPO settings (Optuna)
+hpo:
+  n_trials: 20
+  n_epochs_per_trial: 3
+  search_space:
+    learning_rate: [0.00001, 0.001]
+    dropout_rate: [0.1, 0.5]
+    weight_decay: [0.0001, 0.1]
+    scheduler: ["linear", "cosine"]

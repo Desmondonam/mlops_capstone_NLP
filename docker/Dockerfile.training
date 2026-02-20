@@ -1,0 +1,44 @@
+# ─── Training Container ───────────────────────────────────────────────────
+# Base: Python 3.11 with PyTorch (CPU build for portability)
+# For GPU: change to nvidia/cuda:11.8-cudnn8-runtime-ubuntu22.04
+
+FROM python:3.11-slim
+
+LABEL maintainer="mlops-capstone"
+LABEL description="Training container for NLP Sentiment Classification"
+
+# Prevent interactive prompts
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    git \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+# Download NLTK data
+RUN python -c "import nltk; nltk.download('stopwords'); nltk.download('wordnet'); nltk.download('punkt')"
+
+# Copy source code
+COPY src/ ./src/
+COPY configs/ ./configs/
+COPY scripts/ ./scripts/
+
+# Create necessary directories
+RUN mkdir -p /app/data /app/artifacts /app/mlruns /app/checkpoints
+
+# Set permissions
+RUN chmod +x /app/scripts/*.sh
+
+# Default command: run full training pipeline
+CMD ["python", "-m", "src.training.trainer"]

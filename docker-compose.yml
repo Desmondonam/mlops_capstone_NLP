@@ -1,0 +1,255 @@
+version: '3.9'
+
+# ─── MLOps Capstone - Full Stack Docker Compose ───────────────────────────
+# Launches: Training, Serving, MLflow, Airflow, Prometheus, Grafana
+
+networks:
+  mlops_network:
+    driver: bridge
+
+volumes:
+  mlflow_data:
+  postgres_data:
+  prometheus_data:
+  grafana_data:
+  airflow_logs:
+  model_artifacts:
+  redis_data:
+
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.8.0
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth'
+    MLFLOW_TRACKING_URI: http://mlflow:5000
+    PYTHONPATH: /opt/airflow
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - airflow_logs:/opt/airflow/logs
+    - ./src:/opt/airflow/src
+    - model_artifacts:/opt/airflow/artifacts
+  networks:
+    - mlops_network
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+
+services:
+
+  # ─── PostgreSQL (MLflow + Airflow backend) ─────────────────────────────
+  postgres:
+    image: postgres:15
+    container_name: mlops_postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+      POSTGRES_MULTIPLE_DATABASES: mlflow
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_postgres.sh:/docker-entrypoint-initdb.d/init.sh
+    ports:
+      - "5432:5432"
+    networks:
+      - mlops_network
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+
+  # ─── Redis (Airflow message broker) ───────────────────────────────────
+  redis:
+    image: redis:7.2-bookworm
+    container_name: mlops_redis
+    expose:
+      - 6379
+    networks:
+      - mlops_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 30s
+      retries: 50
+      start_period: 30s
+
+  # ─── MLflow Tracking Server ────────────────────────────────────────────
+  mlflow:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.mlflow
+    container_name: mlops_mlflow
+    ports:
+      - "5000:5000"
+    volumes:
+      - mlflow_data:/mlflow
+      - model_artifacts:/mlflow/artifacts
+    environment:
+      MLFLOW_BACKEND_STORE_URI: postgresql://airflow:airflow@postgres:5432/mlflow
+      MLFLOW_DEFAULT_ARTIFACT_ROOT: /mlflow/artifacts
+    command: >
+      mlflow server
+      --backend-store-uri postgresql://airflow:airflow@postgres:5432/mlflow
+      --default-artifact-root /mlflow/artifacts
+      --host 0.0.0.0
+      --port 5000
+    networks:
+      - mlops_network
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # ─── Model Training Service ────────────────────────────────────────────
+  trainer:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.training
+    container_name: mlops_trainer
+    volumes:
+      - ./src:/app/src
+      - ./configs:/app/configs
+      - model_artifacts:/app/artifacts
+      - ./data:/app/data
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      CUDA_VISIBLE_DEVICES: ""
+      PYTHONPATH: /app
+    networks:
+      - mlops_network
+    depends_on:
+      mlflow:
+        condition: service_healthy
+    command: python -m src.training.trainer
+
+  # ─── FastAPI Serving ───────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.serving
+    container_name: mlops_api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./src:/app/src
+      - model_artifacts:/app/artifacts
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MODEL_STAGE: Production
+      PYTHONPATH: /app
+    networks:
+      - mlops_network
+    depends_on:
+      mlflow:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+
+  # ─── Airflow Webserver ─────────────────────────────────────────────────
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: mlops_airflow_webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: mlops_airflow_scheduler
+    command: scheduler
+    restart: always
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db init
+        airflow users create --username admin --firstname Admin --lastname User \
+          --role Admin --email admin@example.com --password admin
+    restart: "no"
+
+  # ─── Prometheus ────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: mlops_prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./configs/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    networks:
+      - mlops_network
+    restart: unless-stopped
+
+  # ─── Grafana ───────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: mlops_grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./configs/grafana/provisioning:/etc/grafana/provisioning
+      - ./configs/grafana/dashboards:/var/lib/grafana/dashboards
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: 'false'
+    networks:
+      - mlops_network
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+  # ─── Node Exporter (System Metrics) ───────────────────────────────────
+  node-exporter:
+    image: prom/node-exporter:v1.7.0
+    container_name: mlops_node_exporter
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.rootfs=/rootfs'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    expose:
+      - 9100
+    networks:
+      - mlops_network
+    restart: unless-stopped

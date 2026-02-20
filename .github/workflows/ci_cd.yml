@@ -1,0 +1,266 @@
+name: MLOps CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      deploy_environment:
+        description: 'Deploy to environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options: ['staging', 'production']
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ${{ github.repository }}
+  PYTHON_VERSION: "3.11"
+  MLFLOW_TRACKING_URI: "http://mlflow:5000"
+
+jobs:
+  # ─── Code Quality ─────────────────────────────────────────────────────
+  lint-and-type-check:
+    name: 🔍 Lint & Type Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install linting dependencies
+        run: |
+          pip install flake8 black isort mypy pylint
+
+      - name: Check formatting with Black
+        run: black --check src/ tests/
+
+      - name: Check import order
+        run: isort --check-only src/ tests/
+
+      - name: Lint with flake8
+        run: |
+          flake8 src/ tests/ \
+            --max-line-length=120 \
+            --ignore=E501,W503 \
+            --exclude=__pycache__,.git
+
+  # ─── Unit & Integration Tests ─────────────────────────────────────────
+  test:
+    name: 🧪 Run Tests
+    runs-on: ubuntu-latest
+    needs: lint-and-type-check
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest pytest-cov pytest-asyncio httpx
+
+      - name: Run unit tests
+        run: |
+          pytest tests/ \
+            --cov=src \
+            --cov-report=xml \
+            --cov-report=html \
+            -v \
+            --tb=short \
+            -m "not slow"
+
+      - name: Upload coverage report
+        uses: codecov/codecov-action@v4
+        with:
+          file: ./coverage.xml
+          fail_ci_if_error: false
+
+  # ─── Model Training Test ──────────────────────────────────────────────
+  smoke-test-training:
+    name: 🔥 Smoke Test Training
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run smoke test (2 epochs, small batch)
+        run: |
+          python -c "
+          import sys
+          sys.path.insert(0, '.')
+          from src.data.data_loader import DataPipeline, DataConfig
+          from src.models.cnn_model import TextCNN
+          from src.training.trainer import Trainer, TrainingConfig
+
+          # Quick smoke test
+          config = DataConfig(batch_size=8)
+          pipeline = DataPipeline(config)
+          loaders, n_classes = pipeline.prepare_loaders(mode='classical')
+
+          vocab_size = len(pipeline.vocab.word2idx)
+          model = TextCNN(vocab_size=vocab_size, num_classes=n_classes)
+
+          train_config = TrainingConfig(
+              model_type='cnn',
+              num_classes=n_classes,
+              epochs=1,
+              mlflow_uri='./mlruns',
+              patience=1
+          )
+
+          trainer = Trainer(model, train_config)
+          results = trainer.train(loaders['train'], loaders['val'])
+          assert results['best_val_score'] >= 0, 'Training returned invalid score'
+          print(f'Smoke test passed! Score: {results[\"best_val_score\"]:.4f}')
+          "
+        timeout-minutes: 10
+
+  # ─── Docker Build & Push ──────────────────────────────────────────────
+  build-and-push:
+    name: 🐳 Build & Push Docker Images
+    runs-on: ubuntu-latest
+    needs: [test, smoke-test-training]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract metadata
+        id: meta-training
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/training
+          tags: |
+            type=sha
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+
+      - name: Build & push training image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.training
+          push: true
+          tags: ${{ steps.meta-training.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build & push serving image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.serving
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/serving:latest
+            ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/serving:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ─── Integration Tests ────────────────────────────────────────────────
+  integration-test:
+    name: 🔗 Integration Tests
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start services
+        run: docker-compose up -d mlflow api
+
+      - name: Wait for services
+        run: |
+          sleep 30
+          curl --retry 10 --retry-delay 5 -f http://localhost:8000/health
+          curl --retry 10 --retry-delay 5 -f http://localhost:5000/health
+
+      - name: Run API integration tests
+        run: |
+          pip install pytest httpx
+          pytest tests/test_api.py -v --tb=short
+
+      - name: Cleanup
+        if: always()
+        run: docker-compose down
+
+  # ─── Deploy to Staging ────────────────────────────────────────────────
+  deploy-staging:
+    name: 🚀 Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: integration-test
+    environment: staging
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy to staging
+        run: |
+          echo "Deploying to staging environment..."
+          echo "Image: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/serving:${{ github.sha }}"
+          # kubectl set image deployment/ml-api api=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/serving:${{ github.sha }}
+          # Or: docker-compose -f docker-compose.staging.yml up -d
+
+      - name: Run smoke tests on staging
+        run: |
+          echo "Running smoke tests on staging..."
+          # curl https://staging-api.yourcompany.com/health
+
+      - name: Notify deployment
+        run: |
+          echo "✅ Successfully deployed to staging!"
+
+  # ─── Deploy to Production (manual approval) ───────────────────────────
+  deploy-production:
+    name: 🏭 Deploy to Production
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.deploy_environment == 'production'
+    environment:
+      name: production
+      url: https://api.yourcompany.com
+
+    steps:
+      - name: Deploy to production
+        run: |
+          echo "🚀 Deploying to PRODUCTION..."
+          # kubectl apply -f k8s/production/
+          echo "✅ Production deployment complete!"
